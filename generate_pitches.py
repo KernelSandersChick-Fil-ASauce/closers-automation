@@ -35,10 +35,10 @@ HEADERS = {
 def scrape_website_summary(url: str) -> dict:
     """
     Pull a small snapshot of real content from a business's website:
-    page title, meta description, and first ~400 words of visible text.
-    Returns a dict with keys: title, description, body_text, services.
+    page title, meta description, and first ~600 chars of visible text.
+    Returns a dict with keys: title, description, body_text.
     """
-    empty = {"title": "", "description": "", "body_text": "", "services": ""}
+    empty = {"title": "", "description": "", "body_text": ""}
 
     if not url or not url.strip():
         return empty
@@ -62,27 +62,15 @@ def scrape_website_summary(url: str) -> dict:
     meta = soup.find("meta", attrs={"name": "description"})
     description = meta.get("content", "").strip() if meta else ""
 
-    # Visible body text — remove scripts/styles first
+    # Visible body text — strip scripts/styles/nav first
     for tag in soup(["script", "style", "nav", "footer", "header"]):
         tag.decompose()
     body_text = " ".join(soup.get_text(separator=" ").split())[:600]
-
-    # Look for service-related words in the text
-    service_keywords = [
-        "chiropractic", "massage", "facial", "botox", "filler", "laser",
-        "wellness", "acupuncture", "physical therapy", "cosmetic", "spa",
-        "restaurant", "salon", "barbershop", "dental", "optometry",
-        "auto repair", "gym", "pilates", "yoga", "med spa", "medspa",
-        "dermatology", "aesthetic"
-    ]
-    found_services = [kw for kw in service_keywords if kw in body_text.lower()]
-    services = ", ".join(found_services[:4]) if found_services else ""
 
     return {
         "title":       title[:120],
         "description": description[:200],
         "body_text":   body_text,
-        "services":    services,
     }
 
 
@@ -92,62 +80,51 @@ def generate_email(client: anthropic.Anthropic, business: dict, site: dict) -> s
     """
     Use Claude to write a short, personalized cold email for one lead.
     """
-    name    = business.get("Business Name", "")
-    address = business.get("Address", "")
-    gap     = business.get("Has Booking System", "No")
-    notes   = business.get("Notes", "")
-    website = business.get("Website", "")
+    name    = str(business.get("Business Name", "") or "")
+    address = str(business.get("Address", "") or "")
+    gap     = str(business.get("Has Booking System", "No") or "No")
+    notes   = str(business.get("Notes", "") or "")
+    website = str(business.get("Website", "") or "")
 
-    # Determine which solution to pitch
-    if not website or website.strip() == "":
-        solution_focus = (
-            "They don't have a website at all. Pitch a simple, professional "
-            "landing page built with Carrd — looks great, takes 1-2 days, and "
-            "costs almost nothing."
-        )
-    else:
-        solution_focus = (
-            "They have a website but no online booking or contact form. Pitch "
-            "an AI receptionist using Bland.ai that answers calls 24/7 and "
-            "books appointments automatically, so they never miss a new customer."
-        )
+    has_website = bool(website.strip())
 
     # Build context string from scraped content
     site_context = ""
-    if site["title"]:
+    if site.get("title"):
         site_context += f"Page title: {site['title']}\n"
-    if site["description"]:
+    if site.get("description"):
         site_context += f"Meta description: {site['description']}\n"
-    if site["services"]:
-        site_context += f"Services mentioned: {site['services']}\n"
-    if site["body_text"]:
+    if site.get("body_text"):
         site_context += f"Website excerpt: {site['body_text'][:400]}\n"
 
     prompt = f"""You write cold outreach emails for a small business called "The Closers."
-The Closers helps local businesses get more customers by setting up either:
-1. An AI receptionist (using Bland.ai) that answers calls and books appointments automatically
-2. A simple, professional landing page (using Carrd) if they don't have a good website
+The Closers helps local businesses of ANY type get more customers. Two main services:
+1. An AI receptionist (Bland.ai) — answers calls 24/7, books appointments or takes messages automatically, so the business never misses a lead
+2. A simple professional landing page (Carrd) — for businesses with no web presence at all
 
-Here is a lead you need to write an email for:
+The two solutions aren't one-size-fits-all. Think about what actually makes sense for this specific type of business:
+- If they have NO website: pitch the landing page (Carrd)
+- If they have a website but no way to contact/book them: pitch the AI receptionist OR a contact form — whichever fits their industry better. For example, a restaurant needs reservations more than "appointments." An auto shop needs people to call or book a drop-off. A law firm needs a contact form. Use your judgment.
+
+Here is the lead:
 
 Business name: {name}
 Location: {address}
-Gap found: {gap} booking/contact system
+Has a website: {"Yes" if has_website else "No"}
+Booking/contact gap found: {gap}
 Checker notes: {notes}
 {site_context}
 
-What to pitch for THIS lead:
-{solution_focus}
-
 Write a SHORT cold email (4-6 sentences max) that:
-- Opens by referencing something real and specific about their business (use the website content above — NOT generic filler like "I came across your business")
-- Names the specific gap you found in one sentence
-- Briefly explains what The Closers does and why it matters for them specifically
-- Ends with a simple, low-pressure call to action (e.g., "Worth a quick 10-min call?")
-- Sounds like a real person, NOT a marketing email — conversational, no buzzwords, no emojis
-- Does NOT include a subject line, signature, or placeholders like [Name]
+- First, silently figure out what type of business this is from the info above — do NOT state this in the email
+- Opens with one sentence referencing something real and specific about their business (from the website content above). NOT generic filler like "I came across your business online." Something that shows you actually looked.
+- Names the specific gap in one plain sentence (e.g. "I noticed there's no way to book online" or "couldn't find a way to reach you from the site")
+- Briefly explains what The Closers can set up for them and why it matters for their specific type of business
+- Ends with a simple, low-pressure CTA (e.g. "Worth a quick 10-min call?")
+- Sounds like a real person — conversational, direct, no marketing buzzwords, no emojis
+- Does NOT include a subject line, sign-off, or placeholder brackets like [Name]
 
-Just write the email body text. Nothing else."""
+Just write the email body. Nothing else."""
 
     response = client.messages.create(
         model="claude-opus-4-8",
@@ -187,8 +164,14 @@ def run():
 
     for i, idx in enumerate(leads, start=1):
         row = df.loc[idx]
-        name    = row.get("Business Name", "")
-        website = row.get("Website", "") if pd.notna(row.get("Website")) else ""
+        name    = str(row.get("Business Name", "") or "")
+        website = str(row.get("Website", "") or "") if pd.notna(row.get("Website", "")) else ""
+
+        # Skip rows that already have a pitch email
+        existing = str(df.at[idx, "Draft Pitch Email"] or "").strip()
+        if existing and not existing.startswith("[Error"):
+            print(f"[{i}/{len(leads)}] {name} — already done, skipping")
+            continue
 
         print(f"[{i}/{len(leads)}] {name}")
 
