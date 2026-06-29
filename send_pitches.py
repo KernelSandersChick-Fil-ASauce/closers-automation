@@ -88,8 +88,19 @@ def approval_loop(df: pd.DataFrame, app_password: str) -> pd.DataFrame:
         print(draft_email)
         print()
 
-        # Ask for recipient email
-        to_email = input("Send to (email address, or press Enter to skip): ").strip()
+        # Pre-fill email from spreadsheet if we found one automatically
+        found_email = str(row.get("Owner Email", "") or "").strip()
+        if found_email and "@" in found_email:
+            prompt_text = f"Send to [{found_email}] (Enter to confirm, or type a different address, or 'skip'): "
+            answer = input(prompt_text).strip()
+            if answer.lower() == "skip":
+                to_email = ""
+            elif answer == "":
+                to_email = found_email
+            else:
+                to_email = answer
+        else:
+            to_email = input("Send to (email address, or press Enter to skip): ").strip()
         if not to_email:
             df.at[idx, "Email Status"] = "Skipped"
             df.at[idx, "Sent At"]      = ""

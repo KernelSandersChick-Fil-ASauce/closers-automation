@@ -9,9 +9,11 @@ Usage:
 """
 
 import argparse
+import re
 import time
 import requests
 import pandas as pd
+from urllib.parse import urljoin, urlparse
 
 # ── YOUR API KEY ───────────────────────────────────────────────────────────────
 # Paste your Google Places API key here (see README_API_SETUP.txt for instructions)
@@ -24,8 +26,76 @@ OUTPUT_FILE = "results.xlsx"
 PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
 PLACES_DETAILS_URL     = "https://places.googleapis.com/v1/places/{place_id}"
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
+
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+
 # Reuse booking-check logic from Phase 1
 from check_websites import check_website
+
+
+def find_email(website: str) -> str:
+    """
+    Try to find a publicly listed email on a business's website.
+    Checks the homepage and /contact page. Returns the first email found, or "".
+    """
+    if not website or not website.strip():
+        return ""
+
+    url = website.strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    # Pages to check in order
+    base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+    pages_to_try = [url, urljoin(base, "/contact"), urljoin(base, "/contact-us"), urljoin(base, "/about")]
+
+    seen = set()
+    for page in pages_to_try:
+        if page in seen:
+            continue
+        seen.add(page)
+        try:
+            r = requests.get(page, headers=HEADERS, timeout=8)
+            if r.status_code != 200:
+                continue
+
+            # Look for mailto: links first (most reliable)
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if href.startswith("mailto:"):
+                    email = href.replace("mailto:", "").split("?")[0].strip()
+                    if email and "@" in email:
+                        return email
+
+            # Fall back to regex scan of page text
+            emails = EMAIL_RE.findall(r.text)
+            for email in emails:
+                # Filter out common false positives
+                if any(skip in email.lower() for skip in [
+                    "example.", "sentry.", "wix.", "squarespace.", "wordpress.",
+                    ".png", ".jpg", ".gif", ".svg", ".webp", ".css", ".js",
+                    "noreply", "no-reply", "donotreply", "support@wix",
+                ]):
+                    continue
+                # Must have a real TLD (2-6 chars) and no file extensions
+                domain_part = email.split("@")[-1]
+                if "." not in domain_part:
+                    continue
+                return email
+
+        except Exception:
+            continue
+
+    return ""
 
 
 def search_places(query: str, max_results: int) -> list[dict]:
@@ -120,13 +190,17 @@ def run(query: str, max_results: int):
             else "Unknown"
         )
 
-        print(f"         Website: {website or '(none)'} | Booking: {booking_label}")
+        # Try to find a contact email on their website
+        email = find_email(website) if website else ""
+
+        print(f"         Website: {website or '(none)'} | Booking: {booking_label} | Email: {email or '(not found)'}")
 
         results.append({
             "Business Name":      name,
             "Address":            address,
             "Phone":              phone,
             "Website":            website,
+            "Owner Email":        email,
             "Rating":             rating,
             "Has Booking System": booking_label,
             "Notes":              booking["notes"],
