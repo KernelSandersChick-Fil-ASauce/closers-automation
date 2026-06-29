@@ -167,8 +167,9 @@ def run():
         name    = str(row.get("Business Name", "") or "")
         website = str(row.get("Website", "") or "") if pd.notna(row.get("Website", "")) else ""
 
-        # Skip rows that already have a pitch email
-        existing = str(df.at[idx, "Draft Pitch Email"] or "").strip()
+        # Skip rows that already have a valid pitch email
+        raw = df.at[idx, "Draft Pitch Email"]
+        existing = "" if pd.isna(raw) else str(raw).strip()
         if existing and not existing.startswith("[Error"):
             print(f"[{i}/{len(leads)}] {name} — already done, skipping")
             continue
