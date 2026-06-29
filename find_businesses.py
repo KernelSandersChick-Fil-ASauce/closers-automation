@@ -15,13 +15,14 @@ import pandas as pd
 
 # ── YOUR API KEY ───────────────────────────────────────────────────────────────
 # Paste your Google Places API key here (see README_API_SETUP.txt for instructions)
-GOOGLE_API_KEY = "YOUR_API_KEY_HERE"
+GOOGLE_API_KEY = "AIzaSyA-BrHr1cTOjB9-qyPNXb0CEw5BD7eG1g8"
 # ──────────────────────────────────────────────────────────────────────────────
 
 OUTPUT_FILE = "results.xlsx"
 
-PLACES_TEXT_SEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-PLACES_DETAILS_URL     = "https://maps.googleapis.com/maps/api/place/details/json"
+# Places API (New) endpoints
+PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
+PLACES_DETAILS_URL     = "https://places.googleapis.com/v1/places/{place_id}"
 
 # Reuse booking-check logic from Phase 1
 from check_websites import check_website
@@ -29,53 +30,55 @@ from check_websites import check_website
 
 def search_places(query: str, max_results: int) -> list[dict]:
     """
-    Search Google Places for businesses matching the query.
+    Search Google Places (New API) for businesses matching the query.
     Handles pagination to get up to max_results.
-    Returns a list of raw place dicts with place_id, name, address, rating.
     """
     places = []
-    params = {"query": query, "key": GOOGLE_API_KEY}
+    next_page_token = None
 
     while len(places) < max_results:
-        response = requests.get(PLACES_TEXT_SEARCH_URL, params=params, timeout=10)
+        payload = {"textQuery": query, "pageSize": min(20, max_results - len(places))}
+        if next_page_token:
+            payload["pageToken"] = next_page_token
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": GOOGLE_API_KEY,
+            "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.rating,nextPageToken",
+        }
+
+        response = requests.post(PLACES_TEXT_SEARCH_URL, json=payload, headers=headers, timeout=10)
         data = response.json()
 
-        status = data.get("status")
-        if status == "REQUEST_DENIED":
-            print(f"\nERROR: {data.get('error_message', 'API key rejected.')}")
-            print("Make sure you've set your API key in find_businesses.py\n")
-            return []
-        if status not in ("OK", "ZERO_RESULTS"):
-            print(f"\nERROR from Google Places: {status}")
+        if "error" in data:
+            print(f"\nERROR from Google Places: {data['error'].get('message', data['error'])}")
             return []
 
-        places.extend(data.get("results", []))
+        places.extend(data.get("places", []))
+        next_page_token = data.get("nextPageToken")
 
-        next_page_token = data.get("next_page_token")
         if not next_page_token or len(places) >= max_results:
             break
 
-        # Google requires a short delay before using the next page token
         time.sleep(2)
-        params = {"pagetoken": next_page_token, "key": GOOGLE_API_KEY}
 
     return places[:max_results]
 
 
 def get_place_details(place_id: str) -> dict:
     """
-    Fetch phone number and website for a single place using Place Details API.
+    Fetch phone number and website for a single place using Place Details (New API).
     """
-    params = {
-        "place_id": place_id,
-        "fields":   "formatted_phone_number,website",
-        "key":      GOOGLE_API_KEY,
+    url = PLACES_DETAILS_URL.format(place_id=place_id)
+    headers = {
+        "X-Goog-Api-Key": GOOGLE_API_KEY,
+        "X-Goog-FieldMask": "nationalPhoneNumber,websiteUri",
     }
-    response = requests.get(PLACES_DETAILS_URL, params=params, timeout=10)
-    result = response.json().get("result", {})
+    response = requests.get(url, headers=headers, timeout=10)
+    result = response.json()
     return {
-        "phone":   result.get("formatted_phone_number", ""),
-        "website": result.get("website", ""),
+        "phone":   result.get("nationalPhoneNumber", ""),
+        "website": result.get("websiteUri", ""),
     }
 
 
@@ -98,14 +101,14 @@ def run(query: str, max_results: int):
 
     results = []
     for i, place in enumerate(places, start=1):
-        name    = place.get("name", "")
-        address = place.get("formatted_address", "")
+        name    = place.get("displayName", {}).get("text", "")
+        address = place.get("formattedAddress", "")
         rating  = place.get("rating", "")
 
         print(f"[{i}/{len(places)}] {name}")
 
         # Get phone + website from Place Details API
-        details = get_place_details(place["place_id"])
+        details = get_place_details(place["id"])
         phone   = details["phone"]
         website = details["website"]
 
