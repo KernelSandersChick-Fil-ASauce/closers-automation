@@ -195,6 +195,11 @@ def run(query: str, max_results: int):
 
         print(f"         Website: {website or '(none)'} | Booking: {booking_label} | Email: {email or '(not found)'}")
 
+        # Only keep leads — businesses without a working booking/contact system
+        if booking_label == "Yes":
+            print(f"         ✓ Already has booking — skipping")
+            continue
+
         results.append({
             "Business Name":      name,
             "Address":            address,

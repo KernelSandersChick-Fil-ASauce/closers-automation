@@ -88,10 +88,10 @@ def approval_loop(df: pd.DataFrame, app_password: str) -> pd.DataFrame:
         print(draft_email)
         print()
 
-        # Pre-fill email from spreadsheet if we found one automatically
+        # Use found email or skip entirely if none
         found_email = str(row.get("Owner Email", "") or "").strip()
         if found_email and "@" in found_email:
-            prompt_text = f"Send to [{found_email}] (Enter to confirm, or type a different address, or 'skip'): "
+            prompt_text = f"Send to [{found_email}] (Enter to confirm, type a different address, or 'skip'): "
             answer = input(prompt_text).strip()
             if answer.lower() == "skip":
                 to_email = ""
@@ -100,7 +100,13 @@ def approval_loop(df: pd.DataFrame, app_password: str) -> pd.DataFrame:
             else:
                 to_email = answer
         else:
-            to_email = input("Send to (email address, or press Enter to skip): ").strip()
+            # No email found — auto-skip, don't bother asking
+            df.at[idx, "Email Status"] = "No email found"
+            df.at[idx, "Sent At"]      = ""
+            print(f"No email found for {name} — skipping automatically.\n")
+            skipped_count += 1
+            continue
+
         if not to_email:
             df.at[idx, "Email Status"] = "Skipped"
             df.at[idx, "Sent At"]      = ""
