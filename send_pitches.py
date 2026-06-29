@@ -57,7 +57,7 @@ def approval_loop(df: pd.DataFrame, app_password: str) -> pd.DataFrame:
         lambda x: bool(x) and not pd.isna(x) and not str(x).startswith("[Error")
     )
     not_sent = df["Email Status"].apply(
-        lambda x: str(x).strip().lower() not in ("sent", "skipped")
+        lambda x: str(x).strip().lower() not in ("sent",)
         if not pd.isna(x) else True
     )
     pending = df[has_draft & not_sent].index.tolist()

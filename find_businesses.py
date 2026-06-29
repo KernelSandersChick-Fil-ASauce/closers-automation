@@ -208,10 +208,18 @@ def run(query: str, max_results: int):
 
         time.sleep(0.5)  # avoid hitting rate limits
 
-    # Write to Excel
-    df = pd.DataFrame(results)
+    # Append to existing spreadsheet or create new one
+    new_df = pd.DataFrame(results)
+    try:
+        existing_df = pd.read_excel(OUTPUT_FILE)
+        # Drop duplicates by business name + address
+        combined = pd.concat([existing_df, new_df], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["Business Name", "Address"], keep="first")
+    except FileNotFoundError:
+        combined = new_df
+
     with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Results")
+        combined.to_excel(writer, index=False, sheet_name="Results")
         ws = writer.sheets["Results"]
         for col in ws.columns:
             max_len = max(len(str(cell.value or "")) for cell in col) + 4
@@ -220,6 +228,7 @@ def run(query: str, max_results: int):
     print(f"\nDone! Results saved to '{OUTPUT_FILE}'.")
     no_booking = [r for r in results if r["Has Booking System"] in ("No", "Unknown")]
     print(f"Leads without booking systems: {len(no_booking)} / {len(results)}")
+    print(f"Total businesses in spreadsheet: {len(combined)}")
 
 
 if __name__ == "__main__":
