@@ -153,28 +153,52 @@ def run():
 
     if "Draft Pitch Email" not in df.columns:
         df["Draft Pitch Email"] = ""
+    if "Outreach Method" not in df.columns:
+        df["Outreach Method"] = ""
 
-    # Only process leads without a booking system
+    # Only look at leads without a booking system
     leads = df[df["Has Booking System"].isin(["No", "Unknown"])].index.tolist()
-    print(f"Found {len(leads)} leads to write pitches for.\n")
 
     if not leads:
         print("No leads to process. Run find_businesses.py first to find some.")
         return
 
-    for i, idx in enumerate(leads, start=1):
-        row = df.loc[idx]
+    # Split into email leads (have website) and call leads (no website)
+    email_leads = []
+    call_leads  = []
+    for idx in leads:
+        website = df.loc[idx].get("Website", "")
+        website = "" if pd.isna(website) else str(website).strip()
+        if website:
+            email_leads.append(idx)
+        else:
+            call_leads.append(idx)
+
+    # Mark no-website businesses as call leads right away
+    for idx in call_leads:
+        raw = df.at[idx, "Outreach Method"]
+        if pd.isna(raw) or str(raw).strip() == "":
+            df.at[idx, "Outreach Method"] = "Call manually"
+            df.at[idx, "Draft Pitch Email"] = ""
+            name = str(df.loc[idx].get("Business Name", "") or "")
+            phone = str(df.loc[idx].get("Phone", "") or "")
+            print(f"📞 {name} — no website, flagged for manual call {('(' + phone + ')') if phone else ''}")
+
+    print(f"\nFound {len(email_leads)} leads with websites to email, {len(call_leads)} to call manually.\n")
+
+    for i, idx in enumerate(email_leads, start=1):
+        row     = df.loc[idx]
         name    = str(row.get("Business Name", "") or "")
-        website = str(row.get("Website", "") or "") if pd.notna(row.get("Website", "")) else ""
+        website = str(row.get("Website", "") or "")
 
         # Skip rows that already have a valid pitch email
         raw = df.at[idx, "Draft Pitch Email"]
         existing = "" if pd.isna(raw) else str(raw).strip()
         if existing and not existing.startswith("[Error"):
-            print(f"[{i}/{len(leads)}] {name} — already done, skipping")
+            print(f"[{i}/{len(email_leads)}] {name} — already done, skipping")
             continue
 
-        print(f"[{i}/{len(leads)}] {name}")
+        print(f"[{i}/{len(email_leads)}] {name}")
 
         # Scrape website for real content
         print(f"         Scraping website...", end=" ", flush=True)
@@ -185,13 +209,14 @@ def run():
         print(f"         Writing email...", end=" ", flush=True)
         try:
             email = generate_email(client, dict(row), site)
-            df.at[idx, "Draft Pitch Email"] = email
+            df.at[idx, "Draft Pitch Email"]  = email
+            df.at[idx, "Outreach Method"]    = "Email"
             print("done")
         except Exception as e:
             df.at[idx, "Draft Pitch Email"] = f"[Error generating email: {e}]"
             print(f"error: {e}")
 
-        time.sleep(0.5)  # be gentle on rate limits
+        time.sleep(0.5)
 
     # Write updated Excel file
     with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
@@ -201,7 +226,9 @@ def run():
             max_len = max(len(str(cell.value or "")) for cell in col) + 4
             ws.column_dimensions[col[0].column_letter].width = min(max_len, 80)
 
-    print(f"\nDone! Pitch emails saved to '{OUTPUT_FILE}'.")
+    print(f"\nDone! Results saved to '{OUTPUT_FILE}'.")
+    print(f"→ {len(email_leads)} pitch emails written")
+    print(f"→ {len(call_leads)} businesses flagged for manual call")
     print("Review and edit each email before sending — they're drafts, not final copy.")
 
 
