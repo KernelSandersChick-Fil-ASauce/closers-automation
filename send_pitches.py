@@ -22,8 +22,8 @@ from datetime import datetime
 # ── Settings ──────────────────────────────────────────────────────────────────
 
 FROM_EMAIL  = "hqsummitos@gmail.com"
-INPUT_FILE  = "results.xlsx"
-OUTPUT_FILE = "results.xlsx"
+INPUT_FILE  = "leads_email.xlsx"
+OUTPUT_FILE = "leads_email.xlsx"
 
 # ── Email sender ──────────────────────────────────────────────────────────────
 
@@ -53,7 +53,7 @@ def approval_loop(df: pd.DataFrame, app_password: str) -> pd.DataFrame:
     Show each one, wait for S/K/E input, then send or skip.
     """
     # Find rows with a draft email that haven't been sent yet
-    has_draft = df["Draft Pitch Email"].apply(
+    has_draft = df["Draft Email"].apply(
         lambda x: bool(x) and not pd.isna(x) and not str(x).startswith("[Error")
     )
     not_sent = df["Email Status"].apply(
@@ -76,7 +76,7 @@ def approval_loop(df: pd.DataFrame, app_password: str) -> pd.DataFrame:
         name         = str(row.get("Business Name", "") or "Unknown Business")
         address      = str(row.get("Address", "") or "")
         website      = str(row.get("Website", "") or "")
-        draft_email  = str(row["Draft Pitch Email"])
+        draft_email  = str(row["Draft Email"])
 
         print("━" * 60)
         print(f"[{i}/{len(pending)}] {name}")
@@ -89,7 +89,7 @@ def approval_loop(df: pd.DataFrame, app_password: str) -> pd.DataFrame:
         print()
 
         # Use found email or skip entirely if none
-        found_email = str(row.get("Owner Email", "") or "").strip()
+        found_email = str(row.get("Email", "") or "").strip()
         if found_email and "@" in found_email:
             prompt_text = f"Send to [{found_email}] (Enter to confirm, type a different address, or 'skip'): "
             answer = input(prompt_text).strip()

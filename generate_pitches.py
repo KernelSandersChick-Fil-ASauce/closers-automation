@@ -1,13 +1,11 @@
 """
-The Closers - Phase 3: Personalized Cold Email Generator
-Reads results.xlsx, scrapes real content from each lead's website,
-and uses Claude AI to write a short personalized pitch email.
+The Closers - Pitch Generator
+Reads leads_email.xlsx and leads_call.xlsx and generates:
+  - Personalized pitch emails for email leads
+  - Cold call scripts for call leads
 
 Usage:
     python3 generate_pitches.py
-
-Requires:
-    ANTHROPIC_API_KEY environment variable (get one at console.anthropic.com)
 """
 
 import os
@@ -17,10 +15,8 @@ import pandas as pd
 from bs4 import BeautifulSoup
 import anthropic
 
-# ── Settings ──────────────────────────────────────────────────────────────────
-
-INPUT_FILE  = "results.xlsx"
-OUTPUT_FILE = "results.xlsx"
+EMAIL_LEADS_FILE = "leads_email.xlsx"
+CALL_LEADS_FILE  = "leads_call.xlsx"
 
 HEADERS = {
     "User-Agent": (
@@ -30,206 +26,204 @@ HEADERS = {
     )
 }
 
-# ── Website content scraper ───────────────────────────────────────────────────
 
-def scrape_website_summary(url: str) -> dict:
-    """
-    Pull a small snapshot of real content from a business's website:
-    page title, meta description, and first ~600 chars of visible text.
-    Returns a dict with keys: title, description, body_text.
-    """
-    empty = {"title": "", "description": "", "body_text": ""}
-
-    if not url or not url.strip():
-        return empty
-
-    url = url.strip()
+def scrape_website_summary(url: str) -> str:
+    """Return a short text snapshot of a website for context."""
+    if not url or url == "(none)":
+        return ""
     if not url.startswith("http"):
         url = "https://" + url
-
     try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        response.raise_for_status()
+        r = requests.get(url, headers=HEADERS, timeout=8)
+        if r.status_code != 200:
+            return ""
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+        return " ".join(soup.get_text(separator=" ").split())[:500]
     except Exception:
-        return empty
-
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    # Page title
-    title = soup.title.string.strip() if soup.title and soup.title.string else ""
-
-    # Meta description
-    meta = soup.find("meta", attrs={"name": "description"})
-    description = meta.get("content", "").strip() if meta else ""
-
-    # Visible body text — strip scripts/styles/nav first
-    for tag in soup(["script", "style", "nav", "footer", "header"]):
-        tag.decompose()
-    body_text = " ".join(soup.get_text(separator=" ").split())[:600]
-
-    return {
-        "title":       title[:120],
-        "description": description[:200],
-        "body_text":   body_text,
-    }
+        return ""
 
 
-# ── Email generator ───────────────────────────────────────────────────────────
+def generate_email(client: anthropic.Anthropic, name: str, website: str,
+                   issue: str, body_text: str) -> str:
+    prompt = f"""You write cold outreach emails for "The Closers," a service that builds professional websites and sets up AI phone receptionists for local businesses.
 
-def generate_email(client: anthropic.Anthropic, business: dict, site: dict) -> str:
-    """
-    Use Claude to write a short, personalized cold email for one lead.
-    """
-    name    = str(business.get("Business Name", "") or "")
-    address = str(business.get("Address", "") or "")
-    gap     = str(business.get("Has Booking System", "No") or "No")
-    notes   = str(business.get("Notes", "") or "")
-    website = str(business.get("Website", "") or "")
+Business: {name}
+Website: {website}
+Problem found: {issue}
+Website content: {body_text[:400] if body_text else "(no website or inaccessible)"}
 
-    has_website = bool(website.strip())
+Write a SHORT cold email (4-6 sentences) that:
+- Opens referencing something real and specific about their business
+- Names the specific problem you found in one plain sentence
+- Explains what The Closers can fix and why it matters for their type of business
+- Ends with a soft CTA like "Worth a quick 10-min call?"
+- Sounds like a real person — conversational, no buzzwords, no emojis
+- Does NOT include subject line, sign-off, or placeholder brackets
 
-    # Build context string from scraped content
-    site_context = ""
-    if site.get("title"):
-        site_context += f"Page title: {site['title']}\n"
-    if site.get("description"):
-        site_context += f"Meta description: {site['description']}\n"
-    if site.get("body_text"):
-        site_context += f"Website excerpt: {site['body_text'][:400]}\n"
+Just the email body. Nothing else."""
 
-    prompt = f"""You write cold outreach emails for a small business called "The Closers."
-The Closers helps local businesses of ANY type get more customers. Two main services:
-1. An AI receptionist (Bland.ai) — answers calls 24/7, books appointments or takes messages automatically, so the business never misses a lead
-2. A simple professional landing page (Carrd) — for businesses with no web presence at all
-
-The two solutions aren't one-size-fits-all. Think about what actually makes sense for this specific type of business:
-- If they have NO website: pitch the landing page (Carrd)
-- If they have a website but no way to contact/book them: pitch the AI receptionist OR a contact form — whichever fits their industry better. For example, a restaurant needs reservations more than "appointments." An auto shop needs people to call or book a drop-off. A law firm needs a contact form. Use your judgment.
-
-Here is the lead:
-
-Business name: {name}
-Location: {address}
-Has a website: {"Yes" if has_website else "No"}
-Booking/contact gap found: {gap}
-Checker notes: {notes}
-{site_context}
-
-Write a SHORT cold email (4-6 sentences max) that:
-- First, silently figure out what type of business this is from the info above — do NOT state this in the email
-- Opens with one sentence referencing something real and specific about their business (from the website content above). NOT generic filler like "I came across your business online." Something that shows you actually looked.
-- Names the specific gap in one plain sentence (e.g. "I noticed there's no way to book online" or "couldn't find a way to reach you from the site")
-- Briefly explains what The Closers can set up for them and why it matters for their specific type of business
-- Ends with a simple, low-pressure CTA (e.g. "Worth a quick 10-min call?")
-- Sounds like a real person — conversational, direct, no marketing buzzwords, no emojis
-- Does NOT include a subject line, sign-off, or placeholder brackets like [Name]
-
-Just write the email body. Nothing else."""
-
-    response = client.messages.create(
+    r = client.messages.create(
         model="claude-opus-4-8",
         max_tokens=400,
         messages=[{"role": "user", "content": prompt}],
     )
+    return r.content[0].text.strip()
 
-    return response.content[0].text.strip()
+
+def generate_call_script(client: anthropic.Anthropic, name: str, website: str,
+                         issue: str) -> str:
+    prompt = f"""You create cold call scripts for "The Closers," a service that builds professional websites and sets up AI phone receptionists for local businesses.
+
+Business: {name}
+Website: {website or "(none)"}
+Problem found: {issue}
+
+Write a cold call script in this format:
+
+OPENING (1-2 sentences to get their attention — reference the specific issue)
+
+KEY POINTS (3-4 bullet points on why this hurts their business and what The Closers fixes)
+
+OBJECTION RESPONSES:
+- "I already have a website" → (response)
+- "I'm not interested" → (response)
+- "I don't have the budget" → (response)
+- "Send me an email" → (response)
+
+CLOSE (1 sentence to end the call with a next step)
+
+Keep it natural and conversational. Don't make it sound like a script being read."""
+
+    r = client.messages.create(
+        model="claude-opus-4-8",
+        max_tokens=600,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return r.content[0].text.strip()
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def save_excel(df: pd.DataFrame, file: str):
+    with pd.ExcelWriter(file, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Leads")
+        ws = writer.sheets["Leads"]
+        from openpyxl.styles import Font, PatternFill, Alignment
+        for cell in ws[1]:
+            cell.font      = Font(bold=True, color="FFFFFF")
+            cell.fill      = PatternFill("solid", fgColor="2F4F4F")
+            cell.alignment = Alignment(horizontal="center", wrap_text=True)
+        ws.freeze_panes = "A2"
+        for col in ws.columns:
+            max_len = max(len(str(cell.value or "")) for cell in col) + 4
+            ws.column_dimensions[col[0].column_letter].width = min(max_len, 60)
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+        ws.row_dimensions[1].height = 30
 
-def run():
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        print("ERROR: ANTHROPIC_API_KEY environment variable not set.")
-        print("Get a free API key at: https://console.anthropic.com")
-        print("Then run:  export ANTHROPIC_API_KEY='your-key-here'")
-        print("And run this script again.")
+
+def process_email_leads(client: anthropic.Anthropic):
+    try:
+        df = pd.read_excel(EMAIL_LEADS_FILE)
+    except FileNotFoundError:
+        print("No leads_email.xlsx found — run find_businesses.py first.")
         return
 
-    client = anthropic.Anthropic(api_key=api_key)
+    if "Draft Email" not in df.columns:
+        df["Draft Email"] = ""
+    if "Email Status" not in df.columns:
+        df["Email Status"] = ""
+    if "Sent At" not in df.columns:
+        df["Sent At"] = ""
 
-    print(f"Reading '{INPUT_FILE}'...")
-    df = pd.read_excel(INPUT_FILE)
+    pending = df[df["Draft Email"].apply(
+        lambda x: pd.isna(x) or str(x).strip() == "" or str(x).startswith("[Error")
+    )].index.tolist()
 
-    if "Draft Pitch Email" not in df.columns:
-        df["Draft Pitch Email"] = ""
-    if "Outreach Method" not in df.columns:
-        df["Outreach Method"] = ""
-
-    # Only look at leads without a booking system
-    leads = df[df["Has Booking System"].isin(["No", "Unknown"])].index.tolist()
-
-    if not leads:
-        print("No leads to process. Run find_businesses.py first to find some.")
+    if not pending:
+        print("✉  All email leads already have drafts.")
         return
 
-    # Split into email leads (have website) and call leads (no website)
-    email_leads = []
-    call_leads  = []
-    for idx in leads:
-        website = df.loc[idx].get("Website", "")
-        website = "" if pd.isna(website) else str(website).strip()
-        if website:
-            email_leads.append(idx)
-        else:
-            call_leads.append(idx)
+    print(f"✉  Writing emails for {len(pending)} leads...\n")
 
-    # Mark no-website businesses as call leads right away
-    for idx in call_leads:
-        raw = df.at[idx, "Outreach Method"]
-        if pd.isna(raw) or str(raw).strip() == "":
-            df.at[idx, "Outreach Method"] = "Call manually"
-            df.at[idx, "Draft Pitch Email"] = ""
-            name = str(df.loc[idx].get("Business Name", "") or "")
-            phone = str(df.loc[idx].get("Phone", "") or "")
-            print(f"📞 {name} — no website, flagged for manual call {('(' + phone + ')') if phone else ''}")
-
-    print(f"\nFound {len(email_leads)} leads with websites to email, {len(call_leads)} to call manually.\n")
-
-    for i, idx in enumerate(email_leads, start=1):
-        row     = df.loc[idx]
-        name    = str(row.get("Business Name", "") or "")
+    for i, idx in enumerate(pending, start=1):
+        row  = df.loc[idx]
+        name = str(row.get("Business Name", "") or "")
         website = str(row.get("Website", "") or "")
+        issue   = str(row.get("Issue", "") or "")
 
-        # Skip rows that already have a valid pitch email
-        raw = df.at[idx, "Draft Pitch Email"]
-        existing = "" if pd.isna(raw) else str(raw).strip()
-        if existing and not existing.startswith("[Error"):
-            print(f"[{i}/{len(email_leads)}] {name} — already done, skipping")
-            continue
+        print(f"  [{i}/{len(pending)}] {name}...", end=" ", flush=True)
+        body_text = scrape_website_summary(website)
 
-        print(f"[{i}/{len(email_leads)}] {name}")
-
-        # Scrape website for real content
-        print(f"         Scraping website...", end=" ", flush=True)
-        site = scrape_website_summary(website)
-        print("done")
-
-        # Generate email with Claude
-        print(f"         Writing email...", end=" ", flush=True)
         try:
-            email = generate_email(client, dict(row), site)
-            df.at[idx, "Draft Pitch Email"]  = email
-            df.at[idx, "Outreach Method"]    = "Email"
+            email = generate_email(client, name, website, issue, body_text)
+            df.at[idx, "Draft Email"] = email
             print("done")
         except Exception as e:
-            df.at[idx, "Draft Pitch Email"] = f"[Error generating email: {e}]"
+            df.at[idx, "Draft Email"] = f"[Error: {e}]"
             print(f"error: {e}")
 
         time.sleep(0.5)
 
-    # Write updated Excel file
-    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Results")
-        ws = writer.sheets["Results"]
-        for col in ws.columns:
-            max_len = max(len(str(cell.value or "")) for cell in col) + 4
-            ws.column_dimensions[col[0].column_letter].width = min(max_len, 80)
+    save_excel(df, EMAIL_LEADS_FILE)
+    print(f"\n  Saved to '{EMAIL_LEADS_FILE}'")
 
-    print(f"\nDone! Results saved to '{OUTPUT_FILE}'.")
-    print(f"→ {len(email_leads)} pitch emails written")
-    print(f"→ {len(call_leads)} businesses flagged for manual call")
-    print("Review and edit each email before sending — they're drafts, not final copy.")
+
+def process_call_leads(client: anthropic.Anthropic):
+    try:
+        df = pd.read_excel(CALL_LEADS_FILE)
+    except FileNotFoundError:
+        print("No leads_call.xlsx found — run find_businesses.py first.")
+        return
+
+    if "Call Script" not in df.columns:
+        df["Call Script"] = ""
+
+    pending = df[df["Call Script"].apply(
+        lambda x: pd.isna(x) or str(x).strip() == "" or str(x).startswith("[Error")
+    )].index.tolist()
+
+    if not pending:
+        print("📞  All call leads already have scripts.")
+        return
+
+    print(f"📞  Writing call scripts for {len(pending)} leads...\n")
+
+    for i, idx in enumerate(pending, start=1):
+        row     = df.loc[idx]
+        name    = str(row.get("Business Name", "") or "")
+        website = str(row.get("Website", "") or "")
+        issue   = str(row.get("Issue", "") or "")
+
+        print(f"  [{i}/{len(pending)}] {name}...", end=" ", flush=True)
+
+        try:
+            script = generate_call_script(client, name, website, issue)
+            df.at[idx, "Call Script"] = script
+            print("done")
+        except Exception as e:
+            df.at[idx, "Call Script"] = f"[Error: {e}]"
+            print(f"error: {e}")
+
+        time.sleep(0.5)
+
+    save_excel(df, CALL_LEADS_FILE)
+    print(f"\n  Saved to '{CALL_LEADS_FILE}'")
+
+
+def run():
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("ERROR: ANTHROPIC_API_KEY not set. Run: export ANTHROPIC_API_KEY='your-key'")
+        return
+
+    client = anthropic.Anthropic(api_key=api_key)
+    print("Generating pitches...\n")
+    process_email_leads(client)
+    print()
+    process_call_leads(client)
+    print("\nDone! Review your leads before reaching out.")
 
 
 if __name__ == "__main__":
