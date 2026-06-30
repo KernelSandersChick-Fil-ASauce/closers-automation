@@ -54,7 +54,7 @@ def search_places(query: str, max_results: int) -> list[dict]:
         headers = {
             "Content-Type": "application/json",
             "X-Goog-Api-Key": GOOGLE_API_KEY,
-            "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.rating,nextPageToken",
+            "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.rating,places.userRatingCount,nextPageToken",
         }
         response = requests.post(PLACES_TEXT_SEARCH_URL, json=payload, headers=headers, timeout=10)
         data = response.json()
@@ -236,6 +236,108 @@ def find_email(website: str) -> str:
     return ""
 
 
+# ── Pricing tier classification (rule-based, no AI revenue guessing) ───────────
+
+TIER_1_KEYWORDS = [
+    "cafe", "coffee", "bakery", "food truck", "deli", "sandwich", "ice cream",
+    "juice bar", "smoothie", "taco", "convenience store", "laundromat",
+    "boutique", "thrift", "flower shop", "florist", "donut", "bagel",
+    "snow cone", "popcorn", "candy shop", "small retail",
+]
+
+TIER_2_KEYWORDS = [
+    "auto repair", "mechanic", "auto shop", "salon", "barbershop", "barber",
+    "gym", "fitness", "clinic", "spa", "tattoo", "nail salon", "nails",
+    "pet groom", "dry clean", "tire shop", "car wash", "yoga", "pilates",
+    "massage", "chiropract", "physical therapy", "veterinary", "vet clinic",
+    "tutoring", "daycare", "cleaning service", "landscap", "plumb", "hvac",
+    "electrician", "locksmith", "moving company",
+]
+
+TIER_3_KEYWORDS = [
+    "med spa", "medspa", "medical spa", "dentist", "dental", "dermatology",
+    "cosmetic", "plastic surgery", "orthodont", "realtor", "real estate",
+    "financial advisor", "accountant", "cpa", "insurance agency",
+    "wealth management", "consulting firm", "architect", "engineering firm",
+    "private practice", "wellness center", "aesthetic", "concierge",
+]
+
+EXCLUDE_LAW_KEYWORDS = [
+    "law firm", "law office", "attorney", "lawyer", "legal", "esq",
+    "law group", "pllc law", "law pllc", "criminal defense", "injury law",
+]
+
+# Known large chains / franchises to exclude outright
+CHAIN_KEYWORDS = [
+    "the joint chiropractic", "massage envy", "european wax center",
+    "great clips", "supercuts", "sport clips", "jiffy lube", "midas",
+    "firestone", "pep boys", "meineke", "valvoline", "planet fitness",
+    "anytime fitness", "orangetheory", "crunch fitness", "la fitness",
+    "starbucks", "dunkin", "subway", "mcdonald's", "chipotle",
+    "h&r block", "fastsigns", "ups store", "fedex office",
+]
+
+
+def should_exclude(name: str, business_type: str, rating_count) -> dict:
+    """
+    Decide if a business should be excluded entirely (law firms, large/chain businesses).
+    Returns {"exclude": bool, "reason": str, "uncertain": bool}
+    """
+    name_lower = name.lower()
+    type_lower = business_type.lower()
+
+    # Exclude law firms outright
+    if any(kw in name_lower or kw in type_lower for kw in EXCLUDE_LAW_KEYWORDS):
+        return {"exclude": True, "reason": "Law firm — excluded by category", "uncertain": False}
+
+    # Exclude known chains outright
+    if any(kw in name_lower for kw in CHAIN_KEYWORDS):
+        return {"exclude": True, "reason": "Recognized national chain — excluded", "uncertain": False}
+
+    # Review count signals
+    count = 0
+    try:
+        count = int(rating_count) if rating_count else 0
+    except (ValueError, TypeError):
+        count = 0
+
+    if count >= 300:
+        return {"exclude": True, "reason": f"{count} reviews — likely established/large business", "uncertain": False}
+
+    if count >= 150:
+        return {
+            "exclude": False, "uncertain": True,
+            "reason": f"Uncertain size — {count} reviews, verify before pitching",
+        }
+
+    return {"exclude": False, "reason": "", "uncertain": False}
+
+
+def classify_tier(name: str, business_type: str) -> dict:
+    """
+    Rule-based pricing tier based on business category keywords.
+    Returns {"tier": str, "setup_price": str, "retainer": str, "uncertain": bool}
+    """
+    name_lower = name.lower()
+    type_lower = business_type.lower()
+    combined   = f"{name_lower} {type_lower}"
+
+    if any(kw in combined for kw in TIER_1_KEYWORDS):
+        return {"tier": "Tier 1", "setup_price": "$150–250", "retainer": "$50–75/mo", "uncertain": False}
+
+    if any(kw in combined for kw in TIER_3_KEYWORDS):
+        return {"tier": "Tier 3", "setup_price": "$500–800+", "retainer": "$150–250/mo", "uncertain": False}
+
+    if any(kw in combined for kw in TIER_2_KEYWORDS):
+        return {"tier": "Tier 2", "setup_price": "$300–500", "retainer": "$100–150/mo", "uncertain": False}
+
+    # No clear match — default to Tier 2, flag for manual review
+    return {
+        "tier": "Tier 2 (default)", "setup_price": "$300–500", "retainer": "$100–150/mo",
+        "uncertain": True,
+    }
+
+
 # ── Spreadsheet writer ─────────────────────────────────────────────────────────
 
 def append_to_excel(file: str, new_rows: list[dict], dedup_cols: list[str]):
@@ -296,12 +398,21 @@ def run(query: str, max_results: int):
     email_leads = []
     call_leads  = []
     skipped     = 0
+    excluded    = 0
 
     for i, place in enumerate(places, start=1):
-        name    = place.get("displayName", {}).get("text", "")
-        address = place.get("formattedAddress", "")
+        name         = place.get("displayName", {}).get("text", "")
+        address      = place.get("formattedAddress", "")
+        rating_count = place.get("userRatingCount", 0)
 
         print(f"[{i}/{len(places)}] {name}")
+
+        # Check exclusion (law firms, large/chain businesses) BEFORE scoring website
+        exclusion = should_exclude(name, business_type, rating_count)
+        if exclusion["exclude"]:
+            print(f"         ⛔ Excluded — {exclusion['reason']}")
+            excluded += 1
+            continue
 
         details = get_place_details(place["id"])
         phone   = details["phone"]
@@ -322,24 +433,43 @@ def run(query: str, max_results: int):
 
         print(f"✗ LEAD — {score['issue_summary'][:60]}")
 
+        # Classify pricing tier (rule-based on category keywords)
+        tier_info = classify_tier(name, business_type)
+
+        # Build notes — combine size-uncertainty flag and tier-uncertainty flag
+        notes_parts = []
+        if exclusion["uncertain"]:
+            notes_parts.append(exclusion["reason"])
+        if tier_info["uncertain"]:
+            notes_parts.append("No clear category match for tier — defaulted to Tier 2, please verify.")
+        notes = " | ".join(notes_parts)
+
         # Find email
         email = find_email(website) if website else ""
 
         if email:
             email_leads.append({
-                "Business Name": name,
-                "Phone":         phone,
-                "Website":       website or "(none)",
-                "Email":         email,
-                "Issue":         score["issue_summary"],
+                "Business Name":  name,
+                "Phone":          phone,
+                "Website":        website or "(none)",
+                "Email":          email,
+                "Suggested Tier": tier_info["tier"],
+                "Setup Price":    tier_info["setup_price"],
+                "Retainer":       tier_info["retainer"],
+                "Issue":          score["issue_summary"],
+                "My Notes":       notes,
             })
         else:
             call_leads.append({
-                "Business Name": name,
-                "Phone":         phone,
-                "Website":       website or "(none)",
-                "Issue":         score["issue_summary"],
-                "Call Script":   "",  # filled by generate_pitches.py
+                "Business Name":  name,
+                "Phone":          phone,
+                "Website":        website or "(none)",
+                "Suggested Tier": tier_info["tier"],
+                "Setup Price":    tier_info["setup_price"],
+                "Retainer":       tier_info["retainer"],
+                "Issue":          score["issue_summary"],
+                "My Notes":       notes,
+                "Call Script":    "",  # filled by generate_pitches.py
             })
 
         time.sleep(0.5)
@@ -354,6 +484,7 @@ def run(query: str, max_results: int):
         print(f"📞  {len(call_leads)} call leads saved to '{CALL_LEADS_FILE}' ({total} total)")
 
     print(f"\n{skipped} businesses skipped (good websites).")
+    print(f"{excluded} businesses excluded (law firms / large chains).")
     print(f"Total leads found: {len(email_leads) + len(call_leads)}")
 
 
