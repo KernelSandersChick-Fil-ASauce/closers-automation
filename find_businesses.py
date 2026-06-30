@@ -338,6 +338,108 @@ def classify_tier(name: str, business_type: str) -> dict:
     }
 
 
+# ── Recommended price within tier (rule-based, using review count as a maturity signal) ─
+
+TIER_PRICE_BRACKETS = {
+    "Tier 1": [(10, 150, 50), (30, 200, 60), (999, 250, 75)],
+    "Tier 2": [(15, 300, 100), (50, 400, 125), (999, 500, 150)],
+    "Tier 3": [(20, 500, 150), (60, 650, 200), (999, 800, 250)],
+}
+
+
+def estimate_price(tier: str, rating_count) -> dict:
+    """
+    Recommend a SPECIFIC dollar amount within the tier's range, biased toward
+    the low end for newer/smaller businesses (few reviews = likely can't
+    afford much yet) and the high end for more established ones.
+    This is NOT a revenue guess — it only uses review count as a rough
+    maturity signal, the same logic a person would use eyeballing a listing.
+    """
+    base_tier = tier.replace(" (default)", "")
+    brackets  = TIER_PRICE_BRACKETS.get(base_tier, TIER_PRICE_BRACKETS["Tier 2"])
+
+    count = 0
+    try:
+        count = int(rating_count) if rating_count else 0
+    except (ValueError, TypeError):
+        count = 0
+
+    for max_count, setup, retainer in brackets:
+        if count <= max_count:
+            if count <= brackets[0][0]:
+                maturity = "Looks new/small (few reviews) — recommend the low end to close the sale"
+            elif count >= brackets[-2][0]:
+                maturity = "Looks more established — can likely support the higher end"
+            else:
+                maturity = "Moderate size — mid-range pricing"
+            return {
+                "recommended_setup":    f"${setup}",
+                "recommended_retainer": f"${retainer}/mo",
+                "maturity_note":        maturity,
+            }
+
+    # Fallback (shouldn't hit since last bracket is 999)
+    setup, retainer = brackets[-1][1], brackets[-1][2]
+    return {
+        "recommended_setup":    f"${setup}",
+        "recommended_retainer": f"${retainer}/mo",
+        "maturity_note":        "Moderate size — mid-range pricing",
+    }
+
+
+# ── Multi-location / duplicate detection ───────────────────────────────────────
+
+def normalize_name(name: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace."""
+    name = name.lower()
+    name = re.sub(r"[^a-z0-9\s]", "", name)
+    return re.sub(r"\s+", " ", name).strip()
+
+
+def is_likely_same_business(name_a: str, name_b: str) -> bool:
+    """
+    Catch near-duplicate listings Google Places sometimes returns for the
+    same business under slightly different name formatting, e.g.
+    'Holston & Huntley' vs 'Holston & Huntley Trial Attorneys'.
+    """
+    a, b = normalize_name(name_a), normalize_name(name_b)
+    if not a or not b:
+        return False
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    if len(shorter) < 5:
+        return False
+    return shorter in longer
+
+
+def detect_multi_location(places: list[dict]) -> set:
+    """
+    Return the set of place indices that appear to be the same business
+    listed multiple times (exact duplicate OR multi-location chain).
+    """
+    names = [p.get("displayName", {}).get("text", "") for p in places]
+    assigned = [False] * len(names)
+    groups   = []
+
+    for i in range(len(names)):
+        if assigned[i]:
+            continue
+        group = [i]
+        assigned[i] = True
+        for j in range(i + 1, len(names)):
+            if assigned[j]:
+                continue
+            if is_likely_same_business(names[i], names[j]):
+                group.append(j)
+                assigned[j] = True
+        groups.append(group)
+
+    duplicate_indices = set()
+    for group in groups:
+        if len(group) > 1:
+            duplicate_indices.update(group)
+    return duplicate_indices
+
+
 # ── Spreadsheet writer ─────────────────────────────────────────────────────────
 
 def append_to_excel(file: str, new_rows: list[dict], dedup_cols: list[str]):
@@ -393,6 +495,9 @@ def run(query: str, max_results: int):
     # Infer business type from query for better scoring
     business_type = query.split(" in ")[0].strip() if " in " in query else query
 
+    # Detect businesses that appear more than once (exact dupes or multi-location chains)
+    multi_location_indices = detect_multi_location(places)
+
     print(f"Found {len(places)} businesses. Scoring each one...\n")
 
     email_leads = []
@@ -406,6 +511,12 @@ def run(query: str, max_results: int):
         rating_count = place.get("userRatingCount", 0)
 
         print(f"[{i}/{len(places)}] {name}")
+
+        # Skip duplicate/multi-location listings entirely
+        if (i - 1) in multi_location_indices:
+            print(f"         ⛔ Excluded — appears multiple times (duplicate listing or multi-location chain)")
+            excluded += 1
+            continue
 
         # Check exclusion (law firms, large/chain businesses) BEFORE scoring website
         exclusion = should_exclude(name, business_type, rating_count)
@@ -434,10 +545,11 @@ def run(query: str, max_results: int):
         print(f"✗ LEAD — {score['issue_summary'][:60]}")
 
         # Classify pricing tier (rule-based on category keywords)
-        tier_info = classify_tier(name, business_type)
+        tier_info  = classify_tier(name, business_type)
+        price_info = estimate_price(tier_info["tier"], rating_count)
 
-        # Build notes — combine size-uncertainty flag and tier-uncertainty flag
-        notes_parts = []
+        # Build notes — combine size-uncertainty flag, tier-uncertainty flag, and maturity note
+        notes_parts = [price_info["maturity_note"]]
         if exclusion["uncertain"]:
             notes_parts.append(exclusion["reason"])
         if tier_info["uncertain"]:
@@ -449,38 +561,42 @@ def run(query: str, max_results: int):
 
         if email:
             email_leads.append({
-                "Business Name":  name,
-                "Phone":          phone,
-                "Website":        website or "(none)",
-                "Email":          email,
-                "Suggested Tier": tier_info["tier"],
-                "Setup Price":    tier_info["setup_price"],
-                "Retainer":       tier_info["retainer"],
-                "Issue":          score["issue_summary"],
-                "My Notes":       notes,
+                "Business Name":      name,
+                "Phone":              phone,
+                "Website":            website or "(none)",
+                "Email":              email,
+                "Suggested Tier":     tier_info["tier"],
+                "Recommended Price":  price_info["recommended_setup"],
+                "Recommended Retainer": price_info["recommended_retainer"],
+                "Price Range":        f"{tier_info['setup_price']} setup / {tier_info['retainer']} retainer",
+                "Issue":              score["issue_summary"],
+                "My Notes":           notes,
             })
         else:
             call_leads.append({
-                "Business Name":  name,
-                "Phone":          phone,
-                "Website":        website or "(none)",
-                "Suggested Tier": tier_info["tier"],
-                "Setup Price":    tier_info["setup_price"],
-                "Retainer":       tier_info["retainer"],
-                "Issue":          score["issue_summary"],
-                "My Notes":       notes,
-                "Call Script":    "",  # filled by generate_pitches.py
+                "Business Name":      name,
+                "Phone":              phone,
+                "Website":            website or "(none)",
+                "Suggested Tier":     tier_info["tier"],
+                "Recommended Price":  price_info["recommended_setup"],
+                "Recommended Retainer": price_info["recommended_retainer"],
+                "Price Range":        f"{tier_info['setup_price']} setup / {tier_info['retainer']} retainer",
+                "Issue":              score["issue_summary"],
+                "My Notes":           notes,
+                "Call Script":        "",  # filled by generate_pitches.py
             })
 
         time.sleep(0.5)
 
-    # Save both spreadsheets
+    # Save both spreadsheets — dedup on Email/Phone alone since that's the
+    # strongest unique signal (catches the same business showing up under a
+    # slightly different name in a later search)
     if email_leads:
-        total = append_to_excel(EMAIL_LEADS_FILE, email_leads, ["Business Name", "Email"])
+        total = append_to_excel(EMAIL_LEADS_FILE, email_leads, ["Email"])
         print(f"\n✉  {len(email_leads)} email leads saved to '{EMAIL_LEADS_FILE}' ({total} total)")
 
     if call_leads:
-        total = append_to_excel(CALL_LEADS_FILE, call_leads, ["Business Name", "Phone"])
+        total = append_to_excel(CALL_LEADS_FILE, call_leads, ["Phone"])
         print(f"📞  {len(call_leads)} call leads saved to '{CALL_LEADS_FILE}' ({total} total)")
 
     print(f"\n{skipped} businesses skipped (good websites).")
