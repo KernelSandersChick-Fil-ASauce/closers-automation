@@ -561,29 +561,33 @@ def run(query: str, max_results: int):
 
         if email:
             email_leads.append({
-                "Business Name":      name,
-                "Phone":              phone,
-                "Website":            website or "(none)",
-                "Email":              email,
-                "Suggested Tier":     tier_info["tier"],
-                "Recommended Price":  price_info["recommended_setup"],
+                "Business Name":        name,
+                "Phone":                phone,
+                "Website":              website or "(none)",
+                "Email":                email,
+                "Suggested Tier":       tier_info["tier"],
+                "Recommended Price":    price_info["recommended_setup"],
                 "Recommended Retainer": price_info["recommended_retainer"],
-                "Price Range":        f"{tier_info['setup_price']} setup / {tier_info['retainer']} retainer",
-                "Issue":              score["issue_summary"],
-                "My Notes":           notes,
+                "Price Range":          f"{tier_info['setup_price']} setup / {tier_info['retainer']} retainer",
+                "Issue":                score["issue_summary"],
+                "My Notes":             notes,
+                "Category":             business_type,
+                "Status":               "",
             })
         else:
             call_leads.append({
-                "Business Name":      name,
-                "Phone":              phone,
-                "Website":            website or "(none)",
-                "Suggested Tier":     tier_info["tier"],
-                "Recommended Price":  price_info["recommended_setup"],
+                "Business Name":        name,
+                "Phone":                phone,
+                "Website":              website or "(none)",
+                "Suggested Tier":       tier_info["tier"],
+                "Recommended Price":    price_info["recommended_setup"],
                 "Recommended Retainer": price_info["recommended_retainer"],
-                "Price Range":        f"{tier_info['setup_price']} setup / {tier_info['retainer']} retainer",
-                "Issue":              score["issue_summary"],
-                "My Notes":           notes,
-                "Call Script":        "",  # filled by generate_pitches.py
+                "Price Range":          f"{tier_info['setup_price']} setup / {tier_info['retainer']} retainer",
+                "Issue":                score["issue_summary"],
+                "My Notes":             notes,
+                "Call Script":          "",
+                "Category":             business_type,
+                "Status":               "",
             })
 
         time.sleep(0.5)
@@ -604,9 +608,284 @@ def run(query: str, max_results: int):
     print(f"Total leads found: {len(email_leads) + len(call_leads)}")
 
 
+# ── Smart targeting ────────────────────────────────────────────────────────────
+# Business categories ordered by likelihood of having NO website.
+# These are the highest-opportunity categories for The Closers.
+SMART_TARGET_CATEGORIES = [
+    ("food trucks",                    "food truck"),
+    ("home bakeries catering",         "home bakery"),
+    ("hair braiding beauty services",  "hair braiding"),
+    ("flea market vendors",            "flea market vendor"),
+    ("ethnic grocery stores",          "ethnic grocery"),
+    ("alterations tailoring shops",    "alterations tailor"),
+    ("small local churches",           "church"),
+    ("handmade craft sellers",         "craft seller"),
+]
+
+# Mid-size US cities with dense small-business communities and lower web presence.
+# Intentionally avoid NYC/LA/Chicago where every business already has a web agency.
+SMART_TARGET_CITIES = [
+    "Memphis TN",
+    "El Paso TX",
+    "Fresno CA",
+    "Albuquerque NM",
+    "Jackson MS",
+    "Baton Rouge LA",
+    "Stockton CA",
+    "Birmingham AL",
+    "Laredo TX",
+    "Shreveport LA",
+]
+
+
+def run_smart_target(max_per_search: int):
+    """
+    Smart targeting mode: systematically search every high-opportunity
+    business category across every target city. Saves results to the
+    same spreadsheets as normal mode.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("ERROR: ANTHROPIC_API_KEY not set. Run: export ANTHROPIC_API_KEY='your-key'")
+        return
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    total_searches = len(SMART_TARGET_CATEGORIES) * len(SMART_TARGET_CITIES)
+    print(f"\n{'='*60}")
+    print(f"  SMART TARGET MODE")
+    print(f"  {len(SMART_TARGET_CATEGORIES)} categories × {len(SMART_TARGET_CITIES)} cities = {total_searches} searches")
+    print(f"{'='*60}\n")
+
+    grand_email = 0
+    grand_call  = 0
+    search_num  = 0
+
+    for category_query, business_type in SMART_TARGET_CATEGORIES:
+        for city in SMART_TARGET_CITIES:
+            search_num += 1
+            query = f"{category_query} in {city}"
+            print(f"\n[{search_num}/{total_searches}] Searching: \"{query}\"")
+            print("-" * 50)
+
+            places = search_places(query, max_per_search)
+            if not places:
+                print("  No results found.")
+                continue
+
+            multi_location_indices = detect_multi_location(places)
+            email_leads = []
+            call_leads  = []
+            skipped = excluded = 0
+
+            for i, place in enumerate(places, start=1):
+                name         = place.get("displayName", {}).get("text", "")
+                rating_count = place.get("userRatingCount", 0)
+
+                print(f"  [{i}/{len(places)}] {name}")
+
+                if (i - 1) in multi_location_indices:
+                    print(f"           ⛔ Duplicate/chain — skipped")
+                    excluded += 1
+                    continue
+
+                exclusion = should_exclude(name, business_type, rating_count)
+                if exclusion["exclude"]:
+                    print(f"           ⛔ {exclusion['reason']}")
+                    excluded += 1
+                    continue
+
+                details = get_place_details(place["id"])
+                phone   = details["phone"]
+                website = details["website"]
+                site    = scrape_website(website)
+
+                print(f"           Scoring...", end=" ", flush=True)
+                score = score_website(client, name, business_type, website, site)
+
+                if not score["is_lead"]:
+                    print("✓ Good website")
+                    skipped += 1
+                    time.sleep(0.3)
+                    continue
+
+                print(f"✗ LEAD — {score['issue_summary'][:55]}")
+
+                tier_info  = classify_tier(name, business_type)
+                price_info = estimate_price(tier_info["tier"], rating_count)
+
+                notes_parts = [price_info["maturity_note"]]
+                if exclusion["uncertain"]:
+                    notes_parts.append(exclusion["reason"])
+                if tier_info["uncertain"]:
+                    notes_parts.append("No clear category match — defaulted Tier 2, verify.")
+                notes = " | ".join(notes_parts)
+
+                # Tag with category and city for success-rate tracking
+                category_tag = f"{business_type} | {city}"
+
+                email = find_email(website) if website else ""
+
+                if email:
+                    email_leads.append({
+                        "Business Name":        name,
+                        "Phone":                phone,
+                        "Website":              website or "(none)",
+                        "Email":                email,
+                        "Suggested Tier":       tier_info["tier"],
+                        "Recommended Price":    price_info["recommended_setup"],
+                        "Recommended Retainer": price_info["recommended_retainer"],
+                        "Price Range":          f"{tier_info['setup_price']} setup / {tier_info['retainer']} retainer",
+                        "Issue":                score["issue_summary"],
+                        "My Notes":             notes,
+                        "Category":             category_tag,
+                        "Status":               "",
+                    })
+                else:
+                    call_leads.append({
+                        "Business Name":        name,
+                        "Phone":                phone,
+                        "Website":              website or "(none)",
+                        "Suggested Tier":       tier_info["tier"],
+                        "Recommended Price":    price_info["recommended_setup"],
+                        "Recommended Retainer": price_info["recommended_retainer"],
+                        "Price Range":          f"{tier_info['setup_price']} setup / {tier_info['retainer']} retainer",
+                        "Issue":                score["issue_summary"],
+                        "My Notes":             notes,
+                        "Call Script":          "",
+                        "Category":             category_tag,
+                        "Status":               "",
+                    })
+
+                time.sleep(0.5)
+
+            if email_leads:
+                total = append_to_excel(EMAIL_LEADS_FILE, email_leads, ["Email"])
+                grand_email += len(email_leads)
+                print(f"  ✉  {len(email_leads)} email leads saved ({total} total in file)")
+
+            if call_leads:
+                total = append_to_excel(CALL_LEADS_FILE, call_leads, ["Phone"])
+                grand_call += len(call_leads)
+                print(f"  📞  {len(call_leads)} call leads saved ({total} total in file)")
+
+            print(f"  Skipped {skipped} (good websites), excluded {excluded} (chains/law)")
+
+            # Pause between searches to avoid hammering the API
+            time.sleep(1)
+
+    print(f"\n{'='*60}")
+    print(f"  SMART TARGET COMPLETE")
+    print(f"  Total new leads: {grand_email + grand_call}")
+    print(f"  Email leads: {grand_email}  |  Call leads: {grand_call}")
+    print(f"{'='*60}\n")
+
+
+# ── Success rate tracker ───────────────────────────────────────────────────────
+
+def show_success_rates():
+    """
+    Read both spreadsheets and report which business categories and cities
+    are converting best. Looks for a 'Status' column where you've marked
+    leads as 'responded' or 'converted'.
+
+    Usage:  python3 find_businesses.py --stats
+    """
+    from collections import defaultdict
+
+    records = []
+    for file in [EMAIL_LEADS_FILE, CALL_LEADS_FILE]:
+        try:
+            df = pd.read_excel(file)
+            if "Status" not in df.columns or "Category" not in df.columns:
+                continue
+            for _, row in df.iterrows():
+                status   = str(row.get("Status", "") or "").strip().lower()
+                category = str(row.get("Category", "") or "").strip()
+                if not category:
+                    continue
+                # Parse "business_type | City ST" tag written by smart-target mode
+                parts = category.split("|")
+                btype = parts[0].strip() if parts else category
+                city  = parts[1].strip() if len(parts) > 1 else "unknown"
+                records.append({
+                    "type": btype, "city": city,
+                    "responded": status == "responded",
+                    "converted": status == "converted",
+                })
+        except FileNotFoundError:
+            continue
+
+    if not records:
+        print("\nNo status data found yet.")
+        print("Mark leads as 'responded' or 'converted' in the Status column,")
+        print("then run:  python3 find_businesses.py --stats\n")
+        return
+
+    # Aggregate by category
+    by_type = defaultdict(lambda: {"total": 0, "responded": 0, "converted": 0})
+    by_city = defaultdict(lambda: {"total": 0, "responded": 0, "converted": 0})
+
+    for r in records:
+        by_type[r["type"]]["total"]     += 1
+        by_type[r["type"]]["responded"] += r["responded"]
+        by_type[r["type"]]["converted"] += r["converted"]
+        by_city[r["city"]]["total"]     += 1
+        by_city[r["city"]]["responded"] += r["responded"]
+        by_city[r["city"]]["converted"] += r["converted"]
+
+    def pct(n, d):
+        return f"{100*n//d}%" if d else "—"
+
+    print(f"\n{'='*60}")
+    print(f"  SUCCESS RATES BY BUSINESS CATEGORY")
+    print(f"{'='*60}")
+    print(f"  {'Category':<30} {'Leads':>6} {'Resp':>6} {'Conv':>6}")
+    print(f"  {'-'*50}")
+    for btype, s in sorted(by_type.items(), key=lambda x: -x[1]["converted"]):
+        print(f"  {btype:<30} {s['total']:>6} {pct(s['responded'],s['total']):>6} {pct(s['converted'],s['total']):>6}")
+
+    print(f"\n{'='*60}")
+    print(f"  SUCCESS RATES BY CITY")
+    print(f"{'='*60}")
+    print(f"  {'City':<25} {'Leads':>6} {'Resp':>6} {'Conv':>6}")
+    print(f"  {'-'*43}")
+    for city, s in sorted(by_city.items(), key=lambda x: -x[1]["converted"]):
+        print(f"  {city:<25} {s['total']:>6} {pct(s['responded'],s['total']):>6} {pct(s['converted'],s['total']):>6}")
+
+    print()
+    total_leads     = len(records)
+    total_responded = sum(1 for r in records if r["responded"])
+    total_converted = sum(1 for r in records if r["converted"])
+    print(f"  Overall: {total_leads} leads | {pct(total_responded,total_leads)} responded | {pct(total_converted,total_leads)} converted\n")
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("query", help='e.g. "dental offices in Atlanta GA"')
-    parser.add_argument("--max", type=int, default=20)
+    parser = argparse.ArgumentParser(
+        description="The Closers — Business Finder",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python3 find_businesses.py "dental offices in Atlanta GA"
+  python3 find_businesses.py "dental offices in Atlanta GA" --max 30
+  python3 find_businesses.py --smart-target
+  python3 find_businesses.py --smart-target --max 10
+  python3 find_businesses.py --stats
+        """,
+    )
+    parser.add_argument("query", nargs="?", help='Search query e.g. "dental offices in Atlanta GA"')
+    parser.add_argument("--max",          type=int, default=20, help="Max results per search (default 20)")
+    parser.add_argument("--smart-target", action="store_true",  help="Run smart targeting across all high-opportunity categories and cities")
+    parser.add_argument("--stats",        action="store_true",  help="Show success rates by category and city")
     args = parser.parse_args()
-    run(args.query, args.max)
+
+    if args.stats:
+        show_success_rates()
+    elif args.smart_target:
+        run_smart_target(max_per_search=args.max)
+    elif args.query:
+        run(args.query, args.max)
+    else:
+        parser.print_help()
